@@ -1,3 +1,18 @@
+This is special Version of svxreflector by SM0SVX for FM-Funknetz.de
+
+- added BLOCK Permanent Function with User notification
+- added BLOCK User notification 
+- added BLOCK single Users from TG Function
+- added Function to make a BLOCK persistent 
+- added a QSY Deny Function to prevent People playing without rhyme or reason :-)
+- added a Reload Function for V2 User File while Reflector is running so no need to restart reflector after adding V2 Users
+- separated User Lists from general config 
+- separated TG Handling from general config also with Reload Function
+
+
+
+
+
 SvxLink
 =======
 
