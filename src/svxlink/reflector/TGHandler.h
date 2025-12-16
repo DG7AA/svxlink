@@ -60,48 +60,6 @@ Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
 
 /****************************************************************************
  *
- * Forward declarations
- *
- ****************************************************************************/
-
-
-
-/****************************************************************************
- *
- * Namespace
- *
- ****************************************************************************/
-
-//namespace MyNameSpace
-//{
-
-
-/****************************************************************************
- *
- * Forward declarations of classes inside of the declared namespace
- *
- ****************************************************************************/
-
-
-
-/****************************************************************************
- *
- * Defines & typedefs
- *
- ****************************************************************************/
-
-
-
-/****************************************************************************
- *
- * Exported Global Variables
- *
- ****************************************************************************/
-
-
-
-/****************************************************************************
- *
  * Class definitions
  *
  ****************************************************************************/
@@ -135,11 +93,6 @@ class TGHandler : public sigc::trackable
      */
     ~TGHandler(void);
 
-    /**
-     * @brief   A_brief_member_function_description
-     * @param   param1 Description_of_param1
-     * @return  Return_value_of_this_member_function
-     */
     void setConfig(const Async::Config* cfg) { m_cfg = cfg; }
 
     unsigned sqlTimeout(void) const { return m_sql_timeout; }
@@ -163,10 +116,12 @@ class TGHandler : public sigc::trackable
 
     uint32_t TGForClient(ReflectorClient* client);
 
+    // Prüft anhand von ALLOW/DENY-Konfig pro TG
     bool allowTgSelection(ReflectorClient *client, uint32_t tg);
 
     bool showActivity(uint32_t tg) const;
 
+    // Ab jetzt: true, wenn ALLOW **oder** DENY gesetzt ist
     bool isRestricted(uint32_t tg) const;
 
     sigc::signal<void(uint32_t,
@@ -210,9 +165,6 @@ class TGHandler : public sigc::trackable
     void removeClientP(TGInfo *tg_info, ReflectorClient* client);
     void printTGStatus(void);
 };  /* class TGHandler */
-
-
-//} /* namespace */
 
 #endif /* TG_HANDLER_INCLUDED */
 

@@ -39,14 +39,6 @@ Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
 
 /****************************************************************************
  *
- * Project Includes
- *
- ****************************************************************************/
-
-
-
-/****************************************************************************
- *
  * Local Includes
  *
  ****************************************************************************/
@@ -61,46 +53,6 @@ Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
  ****************************************************************************/
 
 using namespace std;
-
-
-/****************************************************************************
- *
- * Defines & typedefs
- *
- ****************************************************************************/
-
-
-
-/****************************************************************************
- *
- * Local class definitions
- *
- ****************************************************************************/
-
-
-
-/****************************************************************************
- *
- * Prototypes
- *
- ****************************************************************************/
-
-
-
-/****************************************************************************
- *
- * Exported Global Variables
- *
- ****************************************************************************/
-
-
-
-/****************************************************************************
- *
- * Local Global Variables
- *
- ****************************************************************************/
-
 
 
 /****************************************************************************
@@ -263,27 +215,63 @@ uint32_t TGHandler::TGForClient(ReflectorClient* client)
 } /* TGHandler::TGForClient */
 
 
+/**
+ * Neu: TG-spezifisches DENY.
+ *
+ * Logik:
+ * 1) Wenn TG#[tg]/DENY gesetzt und Rufzeichen matcht -> verweigern.
+ * 2) Wenn TG#[tg]/ALLOW gesetzt  -> nur erlauben, wenn Match.
+ * 3) Wenn kein ALLOW existiert   -> erlauben (sofern nicht durch DENY gesperrt).
+ *
+ * Fehlerfall:
+ * - Ungültiges ALLOW-Regex: Warnung und Ablehnen (wie bisher).
+ * - Ungültiges DENY-Regex:  Warnung und Ignorieren von DENY.
+ */
 bool TGHandler::allowTgSelection(ReflectorClient *client, uint32_t tg)
 {
   std::ostringstream ss;
   ss << "TG#" << tg;
+
+  const std::string cs = client->callsign();
+
   try
   {
-    std::string allow;
-    if (m_cfg->getValue(ss.str(), "ALLOW", allow))
+    // 1) DENY prüfen (optional)
+    std::string deny;
+    if (m_cfg->getValue(ss.str(), "DENY", deny) && !deny.empty())
     {
-      if (!std::regex_match(client->callsign(), std::regex(allow)))
+      try {
+        if (std::regex_match(cs, std::regex(deny)))
+        {
+          // Explizit gesperrt
+          return false;
+        }
+      } catch (std::regex_error& e) {
+        std::cerr << "*** WARNING: Regular expression parsing error in "
+                  << ss.str() << "/DENY: " << e.what() << std::endl;
+        // DENY-Fehler -> wie „kein DENY“
+      }
+    }
+
+    // 2) ALLOW prüfen (optional)
+    std::string allow;
+    if (m_cfg->getValue(ss.str(), "ALLOW", allow) && !allow.empty())
+    {
+      if (!std::regex_match(cs, std::regex(allow)))
       {
         return false;
       }
-      //std::cout << "### " << client->callsign() << " Match!" << std::endl;
     }
+
+    // 3) Kein ALLOW -> erlaubt (außer DENY hat schon gegriffen)
     return true;
   }
   catch (std::regex_error& e)
   {
+    // Diese catch-Klausel fängt nur den Fall ab, dass der äußere
+    // std::regex(...) Wurf im ALLOW-Zweig oben schon gefangen wurde.
     std::cerr << "*** WARNING: Regular expression parsing error in "
-              << ss.str() << "/ALLOW: " << e.what() << std::endl;
+              << ss.str() << "/ALLOW or /DENY: " << e.what() << std::endl;
   }
   return false;
 } /* TGHandler::allowTgSelection */
@@ -303,17 +291,11 @@ bool TGHandler::isRestricted(uint32_t tg) const
 {
   std::ostringstream ss;
   ss << "TG#" << tg;
-  std::string allow;
-  return m_cfg->getValue(ss.str(), "ALLOW", allow);
+  std::string allow, deny;
+  bool has_allow = m_cfg->getValue(ss.str(), "ALLOW", allow) && !allow.empty();
+  bool has_deny  = m_cfg->getValue(ss.str(), "DENY",  deny)  && !deny.empty();
+  return has_allow || has_deny;
 } /* TGHandler::isRestricted */
-
-
-/****************************************************************************
- *
- * Protected member functions
- *
- ****************************************************************************/
-
 
 
 /****************************************************************************

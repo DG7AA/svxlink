@@ -1,8 +1,8 @@
 /**
-@file	 Reflector.cpp
-@brief   The main reflector class
-@author  Tobias Blomberg / SM0SVX
-@date	 2017-02-11
+@file   Reflector.cpp
+@brief  The main reflector class
+@author Tobias Blomberg / SM0SVX
+@date   2017-02-11
 
 \verbatim
 SvxReflector - An audio reflector for connecting SvxLink Servers
@@ -36,7 +36,13 @@ Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
 #include <fstream>
 #include <iterator>
 #include <regex>
-
+#include <stdexcept>  // <-- hinzugefügt für Parsing-Ausnahmen
+#include <map>        // <-- hinzugefügt für Blocklisten-Persistenz
+#include <limits>     // <-- hinzugefügt für UINT64_MAX (permanent block)
+#include <memory>     // <-- für std::unique_ptr beim JSON-Schreiben
+#include <unordered_set> // <-- Userlist-Reload + QSY_DENY
+#include <sstream>       // <-- Stringstreams für Loader
+#include <ctime>
 
 /****************************************************************************
  *
@@ -102,31 +108,6 @@ using namespace Async;
  ****************************************************************************/
 
 namespace {
-  //void splitFilename(const std::string& filename, std::string& dirname,
-  //    std::string& basename)
-  //{
-  //  std::string ext;
-  //  basename = filename;
-
-  //  size_t basenamepos = filename.find_last_of('/');
-  //  if (basenamepos != string::npos)
-  //  {
-  //    if (basenamepos + 1 < filename.size())
-  //    {
-  //      basename = filename.substr(basenamepos + 1);
-  //    }
-  //    dirname = filename.substr(0, basenamepos + 1);
-  //  }
-
-  //  size_t extpos = basename.find_last_of('.');
-  //  if (extpos != string::npos)
-  //  {
-  //    if (extpos+1 < basename.size())
-  //    ext = basename.substr(extpos+1);
-  //    basename.erase(extpos);
-  //  }
-  //}
-
   bool ensureDirectoryExist(const std::string& path)
   {
     std::vector<std::string> parts;
@@ -174,6 +155,445 @@ namespace {
   } /* startCertRenewTimer */
 };
 
+/****************************************************************************
+ *
+ * Persistente Blockliste (global in dieser Übersetzungseinheit)
+ *
+ ****************************************************************************/
+
+namespace {
+
+  // Datei-Pfad zur Blockliste (per Konfig übersteuerbar)
+  std::string g_blocked_file;
+
+  // Callsign -> Unix-Epoch bis wann geblockt (UINT64_MAX == permanent)
+  std::map<std::string, uint64_t> g_blocked_until_epoch;
+
+  // Nach Entsperren: einmalige Benachrichtigung beim nächsten UDP-Paket
+  std::map<std::string, uint64_t> g_unblock_notice_until;
+
+  inline uint64_t nowEpoch()
+  {
+    return static_cast<uint64_t>(std::time(nullptr));
+  }
+
+  bool saveBlockedList()
+  {
+    Json::Value root(Json::objectValue);
+    Json::Value arr(Json::arrayValue);
+
+    for (const auto& kv : g_blocked_until_epoch)
+    {
+      const auto& cn = kv.first;
+      const uint64_t until = kv.second;
+
+      Json::Value entry(Json::objectValue);
+      entry["callsign"] = cn;
+
+      if (until == std::numeric_limits<uint64_t>::max())
+      {
+        entry["permanent"] = true;
+      }
+      else
+      {
+        entry["permanent"] = false;
+        entry["until"] = Json::UInt64(until);
+      }
+
+      arr.append(entry);
+    }
+
+    root["blocked"] = arr;
+
+    if (g_blocked_file.empty())
+    {
+      std::cerr << "*** ERROR: BLOCKLIST_FILE path is empty.\n";
+      return false;
+    }
+
+    if (!ensureDirectoryExist(g_blocked_file))
+    {
+      std::cerr << "*** ERROR: Cannot ensure directory for '"
+                << g_blocked_file << "'.\n";
+      return false;
+    }
+
+    std::ofstream ofs(g_blocked_file, std::ios::trunc);
+    if (!ofs.good())
+    {
+      std::cerr << "*** ERROR: Cannot open '" << g_blocked_file
+                << "' for writing. Permission denied?\n";
+      return false;
+    }
+
+    Json::StreamWriterBuilder b;
+    b["indentation"] = "  ";
+    std::unique_ptr<Json::StreamWriter> w(b.newStreamWriter());
+    w->write(root, &ofs);
+    return ofs.good();
+  }
+
+  bool loadBlockedList()
+  {
+    g_blocked_until_epoch.clear();
+
+    if (g_blocked_file.empty())
+      return false;
+
+    std::ifstream ifs(g_blocked_file, std::ios::in | std::ios::binary);
+    if (!ifs.good())
+    {
+      // Datei fehlt -> später Default schreiben, kein Fehler
+      return true;
+    }
+
+    std::string content((std::istreambuf_iterator<char>(ifs)),
+                        std::istreambuf_iterator<char>());
+
+    if (content.empty())
+    {
+      std::cerr << "*** WARNING: Blocklist file '" << g_blocked_file
+                << "' is empty. Using default {\"blocked\":[]}.\n";
+      (void)saveBlockedList();
+      return true;
+    }
+
+    Json::CharReaderBuilder rb;
+    rb["collectComments"] = false;
+    std::string errs;
+    Json::Value root;
+
+    std::unique_ptr<Json::CharReader> reader(rb.newCharReader());
+    const char* begin = content.data();
+    const char* end   = begin + content.size();
+    const bool ok = reader->parse(begin, end, &root, &errs);
+
+    if (!ok || !root.isObject() || !root.isMember("blocked") || !root["blocked"].isArray())
+    {
+      std::cerr << "*** WARNING: Failed to parse '" << g_blocked_file
+                << "': " << (errs.empty() ? "invalid content" : errs)
+                << ". Resetting to default {\"blocked\":[]}.\n";
+      g_blocked_until_epoch.clear();
+      (void)saveBlockedList();
+      return true;
+    }
+
+    const auto& arr = root["blocked"];
+    for (const auto& it : arr)
+    {
+      if (!it.isObject()) continue;
+      const auto cn = it.get("callsign", "").asString();
+      if (cn.empty()) continue;
+
+      const bool perm = it.get("permanent", false).asBool();
+      uint64_t until = perm ? std::numeric_limits<uint64_t>::max()
+                            : static_cast<uint64_t>(it.get("until", 0).asUInt64());
+
+      if (until == std::numeric_limits<uint64_t>::max() ||
+          until > static_cast<uint64_t>(std::time(nullptr)))
+      {
+        g_blocked_until_epoch[cn] = until;
+      }
+    }
+    return true;
+  }
+
+  // Auf aktiven Client anwenden (falls verbunden)
+  void applyBlockForCallsign(const std::string& cn)
+  {
+    auto it = g_blocked_until_epoch.find(cn);
+    if (it == g_blocked_until_epoch.end()) return;
+
+    uint64_t until = it->second;
+    auto client = ReflectorClient::lookup(cn);
+    if (!client) return;
+
+    if (until == std::numeric_limits<uint64_t>::max())
+    {
+      client->setBlock(ReflectorClient::PERM_BLOCKTIME);
+      client->sendMsg(MsgError("You are permanently blocked for some reason - please contact Admin Team!"));
+    }
+    else
+    {
+      auto now = nowEpoch();
+      if (until <= now)
+      {
+        g_blocked_until_epoch.erase(it);
+        (void)saveBlockedList();
+        return;
+      }
+      unsigned secs = static_cast<unsigned>(until - now);
+      client->setBlock(secs);
+      client->sendMsg(MsgError(std::string("You are blocked for ")
+                               + std::to_string(secs) + " seconds for some reason - Please contact Admin Team!"));
+    }
+  }
+
+} // anonymous namespace (Blockliste)
+
+/****************************************************************************
+ *
+ * Userlisten-Loader & Live-Reload + QSY-Deny + TG-Handling
+ *
+ ****************************************************************************/
+
+namespace {
+
+  // Merkt sich, welche Keys beim letzten Laden gesetzt wurden
+  std::unordered_set<std::string> g_userlist_prev_keys_dl;
+  std::unordered_set<std::string> g_userlist_prev_keys_ww;
+
+  // QSY-Deny-Liste: Calls, die kein QSY auslösen dürfen
+  std::string g_qsy_deny_file;
+  std::unordered_set<std::string> g_qsy_deny_callsigns;
+
+  // TG-Handling-Datei (externe TG-Definitionen)
+  std::string g_tg_handling_file;
+
+  inline void trim(std::string& s) {
+    auto l = s.find_first_not_of(" \t\r\n");
+    auto r = s.find_last_not_of(" \t\r\n");
+    if (l == std::string::npos) { s.clear(); return; }
+    s = s.substr(l, r - l + 1);
+  }
+
+  static std::string sliceByMarkers(const std::string& content,
+                                    const std::string& beginMarker,
+                                    const std::string& endMarker)
+  {
+    if (beginMarker.empty() || endMarker.empty())
+      return content;
+    auto b = content.find(beginMarker);
+    auto e = content.find(endMarker);
+    if (b == std::string::npos || e == std::string::npos || e < b)
+      return content;
+    e += endMarker.size();
+    return content.substr(b, e - b);
+  }
+
+  static std::unordered_set<std::string>
+  parseKeyValuesIntoConfig(Async::Config& cfg,
+                           const std::string& section,
+                           const std::string& text)
+  {
+    std::unordered_set<std::string> loaded;
+    std::istringstream is(text);
+    std::string line;
+    while (std::getline(is, line)) {
+      std::string s = line;
+      trim(s);
+      if (s.empty()) continue;
+      if (s[0] == '#') continue;           // Kommentare überspringen
+
+      // Sektionen ([USERS]) jetzt zulassen:
+      // früher: if (s.rfind("[", 0) == 0) continue;
+
+      auto eq = s.find('=');
+      if (eq == std::string::npos) continue;
+
+      std::string key = s.substr(0, eq);
+      std::string val = s.substr(eq + 1);
+      trim(key);
+      trim(val);
+
+      if (key.empty()) continue;
+
+      cfg.setValue(section, key, val);
+      loaded.insert(key);
+    }
+    return loaded;
+  }
+
+  static bool reloadOneUserFile(Async::Config& cfg,
+                                const std::string& file,
+                                const std::string& section,
+                                const std::string& beginMarker,
+                                const std::string& endMarker,
+                                std::unordered_set<std::string>& prevKeys)
+  {
+    // Leerer Dateipfad – nur warnen, Semantik beibehalten (true zurück)
+    if (file.empty()) {
+      std::cerr << "[USERLIST] Reload: empty file path given\n";
+      return true;
+    }
+
+    std::ifstream in(file);
+    if (!in.good()) {
+      std::cerr << "*** WARNING: USERLIST reload: cannot open '" << file << "'\n";
+      // Semantik beibehalten: true zurückgeben, damit Gesamt-OK nicht kippt
+      return true;
+    }
+
+    std::string content((std::istreambuf_iterator<char>(in)),
+                         std::istreambuf_iterator<char>());
+    std::string sliced = sliceByMarkers(content, beginMarker, endMarker);
+    auto newly = parseKeyValuesIntoConfig(cfg, section, sliced);
+
+    std::cout << "[USERLIST] Parsed " << newly.size()
+              << " entries from '" << file << "'" << std::endl;
+
+    size_t removed = 0;
+    for (const auto& k : prevKeys) {
+      if (newly.find(k) == newly.end()) {
+        cfg.setValue(section, k, ""); // neutralisieren (kein unset verfügbar)
+        ++removed;
+      }
+    }
+
+    if (removed > 0) {
+      std::cout << "[USERLIST] Removed " << removed
+                << " stale keys for section '" << section
+                << "' from '" << file << "'" << std::endl;
+    }
+
+    std::cout << "[USERLIST] Reload done: file='" << file << "'" << std::endl;
+
+    prevKeys = std::move(newly);
+    return true;
+  }
+
+  static bool reloadAllUserLists(Async::Config& cfg)
+  {
+    std::string section = "USERS";
+    (void)cfg.getValue("GLOBAL", "USERLIST_SECTION", section);
+
+    // Default-Pfade, durch Konfiguration überschreibbar
+    std::string dlFile = "svxreflector.d/users_dl.conf";
+    std::string wwFile = "svxreflector.d/users_ww.conf";
+    (void)cfg.getValue("GLOBAL", "USERLIST_FILE_DL", dlFile);
+    (void)cfg.getValue("GLOBAL", "USERLIST_FILE_WW", wwFile);
+
+    // Marker bewusst ignorieren: leere Strings => sliceByMarkers() liefert vollen Inhalt
+    const std::string noMarker;
+
+    std::cout << "[USERLIST] Reload ALL start: section='" << section
+              << "', dlFile='" << dlFile
+              << "', wwFile='" << wwFile << "'" << std::endl;
+
+    bool ok = true;
+
+    std::cout << "[USERLIST] Reload DL: '" << dlFile << "'" << std::endl;
+    bool r1 = reloadOneUserFile(cfg, dlFile, section, noMarker, noMarker, g_userlist_prev_keys_dl);
+    std::cout << "[USERLIST] Reload DL done, ok=" << (r1 ? "true" : "false") << std::endl;
+    ok &= r1;
+
+    std::cout << "[USERLIST] Reload WW: '" << wwFile << "'" << std::endl;
+    bool r2 = reloadOneUserFile(cfg, wwFile, section, noMarker, noMarker, g_userlist_prev_keys_ww);
+    std::cout << "[USERLIST] Reload WW done, ok=" << (r2 ? "true" : "false") << std::endl;
+    ok &= r2;
+
+    std::cout << "[USERLIST] Reload ALL done, ok=" << (ok ? "true" : "false") << std::endl;
+    return ok;
+  }
+
+  // --------- QSY-Deny-Liste ---------
+
+  bool loadQsyDenyList(const std::string& file)
+  {
+    g_qsy_deny_callsigns.clear();
+
+    if (file.empty()) {
+      std::cerr << "[QSY_DENY] No file configured\n";
+      return false;
+    }
+
+    std::ifstream in(file);
+    if (!in.good()) {
+      std::cerr << "*** WARNING: QSY_DENY: cannot open '" << file << "'\n";
+      return false;
+    }
+
+    std::string line;
+    while (std::getline(in, line)) {
+      trim(line);
+      if (line.empty()) continue;
+      if (line[0] == '#') continue;
+      if (line.front() == '[' && line.back() == ']') continue;
+
+      std::transform(line.begin(), line.end(), line.begin(), ::toupper);
+      g_qsy_deny_callsigns.insert(line);
+    }
+
+    std::cout << "[QSY_DENY] Loaded " << g_qsy_deny_callsigns.size()
+              << " entries from '" << file << "'" << std::endl;
+    return true;
+  }
+
+  inline bool isQsyDenied(const std::string& cs)
+  {
+    if (cs.empty()) return false;
+    std::string tmp = cs;
+    std::transform(tmp.begin(), tmp.end(), tmp.begin(), ::toupper);
+    return (g_qsy_deny_callsigns.find(tmp) != g_qsy_deny_callsigns.end());
+  }
+
+  bool qsyAllowedForClient(ReflectorClient* client)
+  {
+    if (client == nullptr) return false;
+
+    const std::string& cs = client->callsign();
+    if (!isQsyDenied(cs)) {
+      return true;
+    }
+
+    std::cout << cs << ": QSY denied (callsign in qsy_deny.conf)" << std::endl;
+
+    return false;
+  }
+
+  // --------- TG-Handling aus externer Datei ---------
+
+  bool loadTgHandlingFile(Async::Config& cfg, const std::string& file)
+  {
+    if (file.empty()) {
+      std::cerr << "[TG] No TG_HANDLING_FILE configured\n";
+      return false;
+    }
+
+    std::ifstream in(file);
+    if (!in.good()) {
+      std::cerr << "*** WARNING: TG: cannot open '" << file << "'\n";
+      return false;
+    }
+
+    std::string line;
+    std::string current_section;
+    unsigned entries = 0;
+
+    while (std::getline(in, line)) {
+      std::string s = line;
+      trim(s);
+      if (s.empty()) continue;
+      if (s[0] == '#') continue;
+
+      // Neue Sektion: [TG#1], [TG#2], ...
+      if (s.front() == '[' && s.back() == ']') {
+        current_section = s.substr(1, s.size() - 2);
+        trim(current_section);
+        continue;
+      }
+
+      // Nur key=value Zeilen, wenn wir in einer TG-Sektion sind
+      auto eq = s.find('=');
+      if (eq == std::string::npos) continue;
+      if (current_section.empty()) continue;
+
+      std::string key = s.substr(0, eq);
+      std::string val = s.substr(eq + 1);
+      trim(key);
+      trim(val);
+      if (key.empty()) continue;
+
+      cfg.setValue(current_section, key, val);
+      ++entries;
+    }
+
+    std::cout << "[TG] Loaded " << entries
+              << " entries from '" << file << "'" << std::endl;
+    return true;
+  }
+
+} // namespace (Userlisten + QSY-Deny + TG-Handling)
 
 /****************************************************************************
  *
@@ -192,8 +612,6 @@ namespace {
 namespace {
   ReflectorClient::ProtoVerRangeFilter v1_client_filter(
       ProtoVer(1, 0), ProtoVer(1, 999));
-  //ReflectorClient::ProtoVerRangeFilter v2_client_filter(
-  //    ProtoVer(2, 0), ProtoVer(2, 999));
   ReflectorClient::ProtoVerLargerOrEqualFilter ge_v2_client_filter(
       ProtoVer(2, 0));
 };
@@ -348,7 +766,7 @@ bool Reflector::initialize(Async::Config &cfg)
         sigc::mem_fun(*this, &Reflector::httpClientDisconnected));
   }
 
-    // Path for command PTY
+  // Path for command PTY
   string pty_path;
   m_cfg->getValue("GLOBAL", "COMMAND_PTY", pty_path);
   if (!pty_path.empty())
@@ -369,6 +787,19 @@ bool Reflector::initialize(Async::Config &cfg)
   m_cfg->getValue("GLOBAL", "ACCEPT_CERT_EMAIL", m_accept_cert_email);
 
   m_cfg->valueUpdated.connect(sigc::mem_fun(*this, &Reflector::cfgUpdated));
+
+  // >>>>> Userlisten initial einlesen
+  (void)reloadAllUserLists(*m_cfg);
+
+  // >>>>> QSY-Deny-Liste initial laden
+  g_qsy_deny_file = "/etc/svxlink/svxreflector.d/qsy_deny.conf";
+  (void)m_cfg->getValue("GLOBAL", "QSY_DENY_FILE", g_qsy_deny_file);
+  (void)loadQsyDenyList(g_qsy_deny_file);
+
+  // >>>>> TG-Handling-Datei initial laden
+  g_tg_handling_file = "/etc/svxlink/svxreflector.d/tg_handling.conf";
+  (void)m_cfg->getValue("GLOBAL", "TG_HANDLING_FILE", g_tg_handling_file);
+  (void)loadTgHandlingFile(*m_cfg, g_tg_handling_file);
 
   return true;
 } /* Reflector::initialize */
@@ -466,6 +897,11 @@ void Reflector::requestQsy(ReflectorClient *client, uint32_t tg)
     return;
   }
 
+  // QSY-Deny prüfen
+  if (!qsyAllowedForClient(client)) {
+    return;
+  }
+
   if (tg == 0)
   {
     tg = nextRandomQsyTg();
@@ -522,8 +958,6 @@ bool Reflector::renewedClientCert(Async::SslX509& cert)
 
 bool Reflector::signClientCert(Async::SslX509& cert, const std::string& ca_op)
 {
-  //std::cout << "### Reflector::signClientCert" << std::endl;
-
   cert.setSerialNumber();
   cert.setIssuerName(m_issue_ca_cert.subjectName());
   cert.setValidityTime(CERT_VALIDITY_DAYS, CERT_VALIDITY_OFFSET_DAYS);
@@ -553,11 +987,9 @@ bool Reflector::signClientCert(Async::SslX509& cert, const std::string& ca_op)
 
 Async::SslX509 Reflector::signClientCsr(const std::string& cn)
 {
-  //std::cout << "### Reflector::signClientCsr" << std::endl;
-
   Async::SslX509 cert(nullptr);
 
-  auto req = loadClientPendingCsr(cn);
+  Async::SslCertSigningReq req = loadClientPendingCsr(cn);
   if (req.isNull())
   {
     std::cerr << "*** ERROR: Cannot find CSR to sign '" << req.filePath()
@@ -576,7 +1008,6 @@ Async::SslX509 Reflector::signClientCsr(const std::string& cn)
   cert_exts.addExtKeyUsage("clientAuth");
   Async::SslX509ExtSubjectAltName san(exts.subjectAltName());
   cert_exts.addExtension(san);
-  cert.addExtensions(cert_exts);
   Async::SslKeypair csr_pkey(req.publicKey());
   cert.setPublicKey(csr_pkey);
 
@@ -609,7 +1040,6 @@ Async::SslX509 Reflector::loadClientCertificate(const std::string& callsign)
   Async::SslX509 cert;
   if (!cert.readPemFile(m_certs_dir + "/" + callsign + ".crt") ||
       cert.isNull() ||
-      //!cert.verify(m_issue_ca_pkey) ||
       !cert.timeIsWithinRange())
   {
     return nullptr;
@@ -649,14 +1079,12 @@ std::string Reflector::issuingCertPem(void) const
 
 bool Reflector::callsignOk(const std::string& callsign) const
 {
-    // Empty check
   if (callsign.empty())
   {
     std::cout << "*** WARNING: The callsign is empty" << std::endl;
     return false;
   }
 
-    // Accept check
   std::string accept_cs_re_str;
   if (!m_cfg->getValue("GLOBAL", "ACCEPT_CALLSIGN", accept_cs_re_str) ||
       accept_cs_re_str.empty())
@@ -673,7 +1101,6 @@ bool Reflector::callsignOk(const std::string& callsign) const
     return false;
   }
 
-    // Reject check
   std::string reject_cs_re_str;
   m_cfg->getValue("GLOBAL", "REJECT_CALLSIGN", reject_cs_re_str);
   if (!reject_cs_re_str.empty())
@@ -883,7 +1310,6 @@ void Reflector::clientDisconnected(Async::FramedTcpConnection *con,
     broadcastMsg(MsgNodeLeft(client->callsign()),
         ReflectorClient::ExceptFilter(client));
   }
-  //Application::app().runTask([=]{ delete client; });
   delete client;
 } /* Reflector::clientDisconnected */
 
@@ -906,8 +1332,6 @@ bool Reflector::udpCipherDataReceived(const IpAddress& addr, uint16_t port,
   if (m_aad.iv_cntr == 0)
   {
     UdpCipher::InitialAAD iaad;
-    //std::cout << "### Reflector::udpCipherDataReceived: m_aad.iv_cntr="
-    //          << m_aad.iv_cntr << std::endl;
     if (static_cast<size_t>(count) < iaad.packedSize())
     {
       std::cout << "### Reflector::udpCipherDataReceived: "
@@ -919,8 +1343,6 @@ bool Reflector::udpCipherDataReceived(const IpAddress& addr, uint16_t port,
         sizeof(UdpCipher::ClientId));
 
     Async::MsgPacker<UdpCipher::ClientId>::unpack(ss, iaad.client_id);
-    //std::cout << "### Reflector::udpCipherDataReceived: client_id="
-    //          << iaad.client_id << std::endl;
     auto client = ReflectorClient::lookup(iaad.client_id);
     if (client == nullptr)
     {
@@ -935,21 +1357,6 @@ bool Reflector::udpCipherDataReceived(const IpAddress& addr, uint16_t port,
   }
   else if ((client=ReflectorClient::lookup(std::make_pair(addr, port))))
   {
-    //if (static_cast<size_t>(count) < UdpCipher::AADLEN)
-    //{
-    //  std::cout << "### Reflector::udpCipherDataReceived: Datagram too short "
-    //               "to hold associated data" << std::endl;
-    //  return true;
-    //}
-
-    //if (!aad_unpack_ok)
-    //{
-    //  std::cout << "*** WARNING: Unpacking associated data failed for UDP "
-    //               "datagram from " << addr << ":" << port << std::endl;
-    //  return true;
-    //}
-    //std::cout << "### Reflector::udpCipherDataReceived: m_aad.iv_cntr="
-    //          << m_aad.iv_cntr << std::endl;
     m_udp_sock->setCipherIV(UdpCipher::IV{client->udpCipherIVRand(),
                                           client->clientId(), m_aad.iv_cntr});
     m_udp_sock->setCipherKey(client->udpCipherKey());
@@ -968,12 +1375,6 @@ bool Reflector::udpCipherDataReceived(const IpAddress& addr, uint16_t port,
 void Reflector::udpDatagramReceived(const IpAddress& addr, uint16_t port,
                                     void* aadptr, void *buf, int count)
 {
-  //std::cout << "### Reflector::udpDatagramReceived:"
-  //          << " addr=" << addr
-  //          << " port=" << port
-  //          << " count=" << count
-  //          << std::endl;
-
   assert(m_udp_sock->cipherAADLength() >= UdpCipher::AADLEN);
 
   stringstream ss;
@@ -992,9 +1393,6 @@ void Reflector::udpDatagramReceived(const IpAddress& addr, uint16_t port,
   UdpCipher::AAD aad;
   if (aadptr != nullptr)
   {
-    //std::cout << "### Reflector::udpDatagramReceived: m_aad.iv_cntr="
-    //          << m_aad.iv_cntr << std::endl;
-
     stringstream aadss;
     aadss.write(reinterpret_cast<const char *>(aadptr),
         m_udp_sock->cipherAADLength());
@@ -1014,8 +1412,6 @@ void Reflector::udpDatagramReceived(const IpAddress& addr, uint16_t port,
         return;
       }
       assert(iaad.iv_cntr == 0);
-      //std::cout << "### Reflector::udpDatagramReceived: iaad.client_id="
-      //          << iaad.client_id << std::endl;
       client = ReflectorClient::lookup(iaad.client_id);
       if (client == nullptr)
       {
@@ -1033,7 +1429,6 @@ void Reflector::udpDatagramReceived(const IpAddress& addr, uint16_t port,
                   << iaad.client_id << " already registered." << std::endl;
       }
       client->setUdpRxSeq(0);
-      //client->sendUdpMsg(MsgUdpHeartbeat());
     }
     else
     {
@@ -1063,26 +1458,12 @@ void Reflector::udpDatagramReceived(const IpAddress& addr, uint16_t port,
       return;
     }
 
-    if (addr != client->remoteHost())
-    {
-      cerr << "*** WARNING[" << client->callsign()
-           << "]: Incoming UDP packet has the wrong source ip, "
-           << addr << " instead of " << client->remoteHost() << endl;
-      return;
-    }
   }
 
-  //auto client = ReflectorClient::lookup(std::make_pair(addr, port));
-  //if (client == nullptr)
-  //{
-  //  client = ReflectorClient::lookup(header.clientId());
-  //  if (client == nullptr)
-  //  {
-  //    cerr << "*** WARNING: Incoming UDP datagram from " << addr << ":" << port
-  //         << " has invalid client id " << header.clientId() << endl;
-  //    return;
-  //  }
-  //}
+  if (client && !client->callsign().empty())
+  {
+    applyBlockForCallsign(client->callsign());
+  }
 
   if (client->remoteUdpPort() == 0)
   {
@@ -1098,17 +1479,16 @@ void Reflector::udpDatagramReceived(const IpAddress& addr, uint16_t port,
     return;
   }
 
-    // Check sequence number
   if (client->protoVer() >= ProtoVer(3, 0))
   {
-    if (aad.iv_cntr < client->nextUdpRxSeq()) // Frame out of sequence (ignore)
+    if (aad.iv_cntr < client->nextUdpRxSeq())
     {
       std::cout << client->callsign()
                 << ": Dropping out of sequence UDP frame with seq="
                 << aad.iv_cntr << std::endl;
       return;
     }
-    else if (aad.iv_cntr > client->nextUdpRxSeq()) // Frame lost
+    else if (aad.iv_cntr > client->nextUdpRxSeq())
     {
       std::cout << client->callsign() << ": UDP frame(s) lost. Expected seq="
                 << client->nextUdpRxSeq()
@@ -1122,7 +1502,7 @@ void Reflector::udpDatagramReceived(const IpAddress& addr, uint16_t port,
   {
     uint16_t next_udp_rx_seq = client->nextUdpRxSeq() & 0xffff;
     uint16_t udp_rx_seq_diff = header_v2.sequenceNum() - next_udp_rx_seq;
-    if (udp_rx_seq_diff > 0x7fff) // Frame out of sequence (ignore)
+    if (udp_rx_seq_diff > 0x7fff)
     {
       std::cout << client->callsign()
                 << ": Dropping out of sequence frame with seq="
@@ -1130,7 +1510,7 @@ void Reflector::udpDatagramReceived(const IpAddress& addr, uint16_t port,
                 << next_udp_rx_seq << std::endl;
       return;
     }
-    else if (udp_rx_seq_diff > 0) // Frame(s) lost
+    else if (udp_rx_seq_diff > 0)
     {
       cout << client->callsign()
            << ": UDP frame(s) lost. Expected seq=" << next_udp_rx_seq
@@ -1141,8 +1521,6 @@ void Reflector::udpDatagramReceived(const IpAddress& addr, uint16_t port,
 
   client->udpMsgReceived(header);
 
-  //std::cout << "### Reflector::udpDatagramReceived: type="
-  //          << header.type() << std::endl;
   switch (header.type())
   {
     case MsgUdpHeartbeat::TYPE:
@@ -1175,51 +1553,11 @@ void Reflector::udpDatagramReceived(const IpAddress& addr, uint16_t port,
                 ReflectorClient::mkAndFilter(
                   ReflectorClient::ExceptFilter(client),
                   ReflectorClient::TgFilter(tg)));
-            //broadcastUdpMsgExcept(tg, client, msg,
-            //    ProtoVerRange(ProtoVer(0, 6),
-            //                  ProtoVer(1, ProtoVer::max().minor())));
-            //MsgUdpAudio msg_v2(msg);
-            //broadcastUdpMsgExcept(tg, client, msg_v2,
-            //    ProtoVerRange(ProtoVer(2, 0), ProtoVer::max()));
           }
         }
       }
       break;
     }
-
-    //case MsgUdpAudio::TYPE:
-    //{
-    //  if (!client->isBlocked())
-    //  {
-    //    MsgUdpAudio msg;
-    //    if (!msg.unpack(ss))
-    //    {
-    //      cerr << "*** WARNING[" << client->callsign()
-    //           << "]: Could not unpack incoming MsgUdpAudio message" << endl;
-    //      return;
-    //    }
-    //    if (!msg.audioData().empty())
-    //    {
-    //      if (m_talker == 0)
-    //      {
-    //        setTalker(client);
-    //        cout << m_talker->callsign() << ": Talker start on TG #"
-    //             << msg.tg() << endl;
-    //      }
-    //      if (m_talker == client)
-    //      {
-    //        gettimeofday(&m_last_talker_timestamp, NULL);
-    //        broadcastUdpMsgExcept(tg, client, msg,
-    //            ProtoVerRange(ProtoVer(2, 0), ProtoVer::max()));
-    //        MsgUdpAudioV1 msg_v1(msg.audioData());
-    //        broadcastUdpMsgExcept(tg, client, msg_v1,
-    //            ProtoVerRange(ProtoVer(0, 6),
-    //                          ProtoVer(1, ProtoVer::max().minor())));
-    //      }
-    //    }
-    //  }
-    //  break;
-    //}
 
     case MsgUdpFlushSamples::TYPE:
     {
@@ -1229,17 +1567,11 @@ void Reflector::udpDatagramReceived(const IpAddress& addr, uint16_t port,
       {
         TGHandler::instance()->setTalkerForTG(tg, 0);
       }
-        // To be 100% correct the reflector should wait for all connected
-        // clients to send a MsgUdpAllSamplesFlushed message but that will
-        // probably lead to problems, especially on reflectors with many
-        // clients. We therefore acknowledge the flush immediately here to
-        // the client who sent the flush request.
       client->sendUdpMsg(MsgUdpAllSamplesFlushed());
       break;
     }
 
     case MsgUdpAllSamplesFlushed::TYPE:
-      // Ignore
       break;
 
     case MsgUdpSignalStrengthValues::TYPE:
@@ -1258,13 +1590,6 @@ void Reflector::udpDatagramReceived(const IpAddress& addr, uint16_t port,
         for (RxsIter it = msg.rxs().begin(); it != msg.rxs().end(); ++it)
         {
           const MsgUdpSignalStrengthValues::Rx& rx = *it;
-          //std::cout << "### MsgUdpSignalStrengthValues:"
-          //  << " id=" << rx.id()
-          //  << " siglev=" << rx.siglev()
-          //  << " enabled=" << rx.enabled()
-          //  << " sql_open=" << rx.sqlOpen()
-          //  << " active=" << rx.active()
-          //  << std::endl;
           client->setRxSiglev(rx.id(), rx.siglev());
           client->setRxEnabled(rx.id(), rx.enabled());
           client->setRxSqlOpen(rx.id(), rx.sqlOpen());
@@ -1275,12 +1600,6 @@ void Reflector::udpDatagramReceived(const IpAddress& addr, uint16_t port,
     }
 
     default:
-      // Better ignoring unknown messages to make it easier to add messages to
-      // the protocol but still be backwards compatible
-
-      //cerr << "*** WARNING[" << client->callsign()
-      //     << "]: Unknown UDP protocol message received: msg_type="
-      //     << header.type() << endl;
       break;
   }
 } /* Reflector::udpDatagramReceived */
@@ -1329,8 +1648,6 @@ void Reflector::onTalkerUpdated(uint32_t tg, ReflectorClient* old_talker,
 void Reflector::httpRequestReceived(Async::HttpServerConnection *con,
                                     Async::HttpServerConnection::Request& req)
 {
-  //std::cout << "### " << req.method << " " << req.target << std::endl;
-
   Async::HttpServerConnection::Response res;
   if ((req.method != "GET") && (req.method != "HEAD"))
   {
@@ -1353,7 +1670,7 @@ void Reflector::httpRequestReceived(Async::HttpServerConnection *con,
   std::ostringstream os;
   Json::StreamWriterBuilder builder;
   builder["commentStyle"] = "None";
-  builder["indentation"] = ""; //The JSON document is written on a single line
+  builder["indentation"] = "";
   Json::StreamWriter* writer = builder.newStreamWriter();
   writer->write(m_status, &os);
   delete writer;
@@ -1367,8 +1684,6 @@ void Reflector::httpRequestReceived(Async::HttpServerConnection *con,
 
 void Reflector::httpClientConnected(Async::HttpServerConnection *con)
 {
-  //std::cout << "### HTTP Client connected: "
-  //          << con->remoteHost() << ":" << con->remotePort() << std::endl;
   con->requestReceived.connect(sigc::mem_fun(*this, &Reflector::httpRequestReceived));
 } /* Reflector::httpClientConnected */
 
@@ -1376,15 +1691,17 @@ void Reflector::httpClientConnected(Async::HttpServerConnection *con)
 void Reflector::httpClientDisconnected(Async::HttpServerConnection *con,
     Async::HttpServerConnection::DisconnectReason reason)
 {
-  //std::cout << "### HTTP Client disconnected: "
-  //          << con->remoteHost() << ":" << con->remotePort()
-  //          << ": " << Async::HttpServerConnection::disconnectReasonStr(reason)
-  //          << std::endl;
 } /* Reflector::httpClientDisconnected */
 
 
 void Reflector::onRequestAutoQsy(uint32_t from_tg)
 {
+  // Herausfinden, wer das QSY angefordert hat (Talker)
+  ReflectorClient* talker = TGHandler::instance()->talkerForTG(from_tg);
+  if (talker && !qsyAllowedForClient(talker)) {
+    return;
+  }
+
   uint32_t tg = nextRandomQsyTg();
   if (tg == 0) { return; }
 
@@ -1429,8 +1746,6 @@ void Reflector::ctrlPtyDataReceived(const void *buf, size_t count)
 {
   const char* ptr = reinterpret_cast<const char*>(buf);
   const std::string cmdline(ptr, ptr + count);
-  //std::cout << "### Reflector::ctrlPtyDataReceived: " << cmdline
-  //          << std::endl;
   std::istringstream ss(cmdline);
   std::ostringstream errss;
   std::string cmd;
@@ -1476,38 +1791,233 @@ void Reflector::ctrlPtyDataReceived(const void *buf, size_t count)
         }
       }
     }
-    //if ((ss >> section >> tag >> value) || !ss.eof())
-    //{
-    //  errss << "Invalid CFG PTY command '" << cmdline << "'. "
-    //           "Usage: CFG <section> <tag> <value>";
-    //  goto write_status;
-    //}
   }
   else if (cmd == "NODE")
   {
-    std::string subcmd, callsign;
-    unsigned blocktime;
-    if (!(ss >> subcmd >> callsign >> blocktime))
+    std::string subcmd, callsign, blocktime_str;
+    if (!(ss >> subcmd >> callsign >> blocktime_str))
     {
       errss << "Invalid NODE PTY command '" << cmdline << "'. "
-               "Usage: NODE BLOCK <callsign> <blocktime seconds>";
+               "Usage: NODE BLOCK <callsign> <seconds|0|00>";
       goto write_status;
     }
     std::transform(subcmd.begin(), subcmd.end(), subcmd.begin(), ::toupper);
+
+    if (subcmd == "UNBLOCK") { blocktime_str = "0"; subcmd = "BLOCK"; }
+
     if (subcmd == "BLOCK")
     {
-      auto node = ReflectorClient::lookup(callsign);
-      if (node == nullptr)
+      ReflectorClient* node = ReflectorClient::lookup(callsign);
+
+      const bool permanent = (blocktime_str == "00");
+      unsigned blocktime_val = 0;
+
+      if (!permanent)
       {
-        errss << "Could not find node " << callsign;
-        goto write_status;
+        try
+        {
+          size_t idx = 0;
+          unsigned long v = std::stoul(blocktime_str, &idx, 10);
+          if (idx != blocktime_str.size())
+            throw std::invalid_argument("trailing chars");
+          blocktime_val = static_cast<unsigned>(v);
+        }
+        catch (const std::exception&)
+        {
+          errss << "Invalid blocktime '" << blocktime_str
+                << "'. Use <seconds|0|00>";
+          goto write_status;
+        }
       }
-      node->setBlock(blocktime);
+
+      if (permanent)
+      {
+        g_blocked_until_epoch[callsign] = std::numeric_limits<uint64_t>::max();
+        (void)saveBlockedList();
+
+        std::cout << callsign << ": Unblock state changed -> PERMANENT BLOCK" << std::endl;
+
+        if (node)
+        {
+          node->setBlock(ReflectorClient::PERM_BLOCKTIME);
+          node->sendMsg(MsgError("You are permanently blocked for some reason - please contact Admin Team!"));
+        }
+      }
+      else if (blocktime_val == 0)
+      {
+        g_blocked_until_epoch.erase(callsign);
+        (void)saveBlockedList();
+
+        std::cout << callsign << ": Unblocked" << std::endl;
+
+        if (node)
+        {
+          node->setBlock(0);
+          node->sendMsg(MsgError("You are unblocked."));
+        }
+        else
+        {
+          g_unblock_notice_until[callsign] = nowEpoch() + 3600;
+        }
+      }
+      else
+      {
+        const uint64_t until = nowEpoch() + static_cast<uint64_t>(blocktime_val);
+        g_blocked_until_epoch[callsign] = until;
+        (void)saveBlockedList();
+
+        std::cout << callsign << ": Temporary block for "
+                  << blocktime_val << " seconds" << std::endl;
+
+        if (node)
+        {
+          node->setBlock(blocktime_val);
+          node->sendMsg(MsgError(std::string("You are blocked for ")
+                                 + std::to_string(blocktime_val) + " seconds for some reason - please contact Admin Team!"));
+        }
+      }
     }
     else
     {
       errss << "Invalid NODE PTY command '" << cmdline << "'. "
-               "Usage: NODE BLOCK <callsign> <blocktime seconds>";
+               "Usage: NODE BLOCK <callsign> <seconds|0|00>";
+      goto write_status;
+    }
+  }
+  else if (cmd == "USERLIST")
+  {
+    std::string subcmd;
+    if (!(ss >> subcmd)) {
+      errss << "Invalid USERLIST PTY command '" << cmdline << "'. "
+               "Usage: USERLIST RELOAD [DL|WW|ALL] [<file>] [<section>] [<beginMarker>] [<endMarker>]";
+      goto write_status;
+    }
+    std::transform(subcmd.begin(), subcmd.end(), subcmd.begin(), ::toupper);
+    if (subcmd != "RELOAD") {
+      errss << "Invalid USERLIST PTY command '" << cmdline << "'. "
+               "Usage: USERLIST RELOAD [DL|WW|ALL] [<file>] [<section>] [<beginMarker>] [<endMarker>]";
+      goto write_status;
+    }
+
+    std::string which; ss >> which;
+    std::string fileOverride, sectionOverride, beginOverride, endOverride;
+    if (!which.empty() && (which=="DL" || which=="WW" || which=="ALL")) {
+      ss >> fileOverride >> sectionOverride >> beginOverride >> endOverride;
+    } else {
+      fileOverride = which;
+      which.clear();
+      ss >> sectionOverride >> beginOverride >> endOverride;
+    }
+
+    std::string section = "USERS";
+    (void)m_cfg->getValue("GLOBAL", "USERLIST_SECTION", section);
+
+    std::string dlFile = "svxreflector.d/users_dl.conf";
+    std::string wwFile = "svxreflector.d/users_ww.conf";
+    (void)m_cfg->getValue("GLOBAL", "USERLIST_FILE_DL", dlFile);
+    (void)m_cfg->getValue("GLOBAL", "USERLIST_FILE_WW", wwFile);
+
+    std::string dlBegin = "### Userlist DL Begin ###";
+    std::string dlEnd   = "### Userlist DL End ###";
+    std::string wwBegin = "### Userlist WW Begin ###";
+    std::string wwEnd   = "### Userlist WW End ###";
+    (void)m_cfg->getValue("GLOBAL", "USERLIST_DL_BEGIN", dlBegin);
+    (void)m_cfg->getValue("GLOBAL", "USERLIST_DL_END",   dlEnd);
+    (void)m_cfg->getValue("GLOBAL", "USERLIST_WW_BEGIN", wwBegin);
+    (void)m_cfg->getValue("GLOBAL", "USERLIST_WW_END",   wwEnd);
+
+    bool ok = true;
+    auto doReload = [&](const std::string& whichSel){
+      if (whichSel=="DL") {
+        std::string f = fileOverride.empty()? dlFile : fileOverride;
+        std::string s = sectionOverride.empty()? section : sectionOverride;
+        std::string b = beginOverride.empty()? dlBegin : beginOverride;
+        std::string e = endOverride.empty()?   dlEnd   : endOverride;
+        ok &= reloadOneUserFile(*m_cfg, f, s, b, e, g_userlist_prev_keys_dl);
+      } else if (whichSel=="WW") {
+        std::string f = fileOverride.empty()? wwFile : fileOverride;
+        std::string s = sectionOverride.empty()? section : sectionOverride;
+        std::string b = beginOverride.empty()? wwBegin : beginOverride;
+        std::string e = endOverride.empty()?   wwEnd   : endOverride;
+        ok &= reloadOneUserFile(*m_cfg, f, s, b, e, g_userlist_prev_keys_ww);
+      }
+    };
+
+    if (which.empty() || which=="ALL") {
+      ok &= reloadAllUserLists(*m_cfg);
+    } else if (which=="DL" || which=="WW") {
+      doReload(which);
+    } else {
+      errss << "USERLIST RELOAD: invalid scope '" << which << "'. Use DL|WW|ALL";
+      goto write_status;
+    }
+
+    if (!ok) {
+      errss << "Userlist reload failed";
+      goto write_status;
+    }
+  }
+  else if (cmd == "QSYDENY")
+  {
+    std::string subcmd;
+    if (!(ss >> subcmd)) {
+      errss << "Invalid QSYDENY PTY command '" << cmdline << "'. "
+               "Usage: QSYDENY RELOAD [<file>]";
+      goto write_status;
+    }
+    std::transform(subcmd.begin(), subcmd.end(), subcmd.begin(), ::toupper);
+
+    if (subcmd == "RELOAD")
+    {
+      std::string fileOverride;
+      ss >> fileOverride;
+      if (!fileOverride.empty())
+      {
+        g_qsy_deny_file = fileOverride;
+      }
+
+      if (!loadQsyDenyList(g_qsy_deny_file))
+      {
+        errss << "QSYDENY reload failed for file '" << g_qsy_deny_file << "'";
+        goto write_status;
+      }
+    }
+    else
+    {
+      errss << "Invalid QSYDENY PTY command '" << cmdline << "'. "
+               "Usage: QSYDENY RELOAD [<file>]";
+      goto write_status;
+    }
+  }
+  else if (cmd == "TG")
+  {
+    std::string subcmd;
+    if (!(ss >> subcmd)) {
+      errss << "Invalid TG PTY command '" << cmdline << "'. "
+               "Usage: TG RELOAD [<file>]";
+      goto write_status;
+    }
+    std::transform(subcmd.begin(), subcmd.end(), subcmd.begin(), ::toupper);
+
+    if (subcmd == "RELOAD")
+    {
+      std::string fileOverride;
+      ss >> fileOverride;
+      if (!fileOverride.empty())
+      {
+        g_tg_handling_file = fileOverride;
+      }
+
+      if (!loadTgHandlingFile(*m_cfg, g_tg_handling_file))
+      {
+        errss << "TG reload failed for file '" << g_tg_handling_file << "'";
+        goto write_status;
+      }
+    }
+    else
+    {
+      errss << "Invalid TG PTY command '" << cmdline << "'. "
+               "Usage: TG RELOAD [<file>]";
       goto write_status;
     }
   }
@@ -1582,17 +2092,17 @@ void Reflector::ctrlPtyDataReceived(const void *buf, size_t count)
   else
   {
     errss << "Unknown PTY command '" << cmdline
-          << "'. Valid commands are: CFG";
+          << "'. Valid commands are: CFG, NODE, USERLIST, QSYDENY, TG, CA";
   }
 
-  write_status:
-    if (!errss.str().empty())
-    {
-      std::cerr << "*** ERROR: " << errss.str() << std::endl;
-      m_cmd_pty->write(std::string("ERR:") + errss.str() + "\n");
-      return;
-    }
-    m_cmd_pty->write("OK\n");
+write_status:
+  if (!errss.str().empty())
+  {
+    std::cerr << "*** ERROR: " << errss.str() << std::endl;
+    m_cmd_pty->write(std::string("ERR:") + errss.str() + "\n");
+    return;
+  }
+  m_cmd_pty->write("OK\n");
 } /* Reflector::ctrlPtyDataReceived */
 
 
@@ -1618,7 +2128,6 @@ void Reflector::cfgUpdated(const std::string& section, const std::string& tag)
         return;
       }
       TGHandler::instance()->setSqlTimeoutBlocktime(t);
-      //std::cout << "### New value for " << tag << "=" << t << std::endl;
     }
     else if (tag == "SQL_TIMEOUT")
     {
@@ -1630,7 +2139,6 @@ void Reflector::cfgUpdated(const std::string& section, const std::string& tag)
         return;
       }
       TGHandler::instance()->setSqlTimeout(t);
-      //std::cout << "### New value for " << tag << "=" << t << std::endl;
     }
   }
 } /* Reflector::cfgUpdated */
@@ -1694,8 +2202,32 @@ bool Reflector::loadCertificateFiles(void)
   }
   ca_dgst.signInit(MsgCABundle::MD_ALG, m_issue_ca_pkey);
   m_ca_sig = ca_dgst.sign(bundle);
-  //m_ca_url = "";
-  //m_cfg->getValue("GLOBAL", "CERT_CA_URL", m_ca_url);
+
+  // --- Blockliste initialisieren / laden ---
+  {
+    std::string cfg_blockfile;
+    if (!m_cfg->getValue("GLOBAL", "BLOCKLIST_FILE", cfg_blockfile) || cfg_blockfile.empty())
+    {
+      g_blocked_file = m_pki_dir + "/blocked.json";
+    }
+    else
+    {
+      g_blocked_file = cfg_blockfile;
+    }
+
+    (void)loadBlockedList();
+
+    if (access(g_blocked_file.c_str(), F_OK) != 0)
+    {
+      if (!saveBlockedList())
+      {
+        std::cerr << "*** WARNING: Failed to create blocked list file '"
+                  << g_blocked_file
+                  << "'. Check directory permissions or choose a writable path."
+                  << std::endl;
+      }
+    }
+  }
 
   return true;
 } /* Reflector::loadCertificateFiles */
@@ -1756,8 +2288,6 @@ bool Reflector::loadServerCertificateFiles(void)
     {
       int days=0, seconds=0;
       cert.validityTime(days, seconds);
-      //std::cout << "### days=" << days << "  seconds=" << seconds
-      //          << std::endl;
       time_t tnow = time(NULL);
       time_t renew_time = tnow + (days*24*3600 + seconds)*RENEW_AFTER;
       if (!cert.timeIsWithinRange(tnow, renew_time))
@@ -1772,11 +2302,6 @@ bool Reflector::loadServerCertificateFiles(void)
   }
   if (generate_cert)
   {
-    //if (!pkey_fresh && !generateKeyFile(pkey, keyfile))
-    //{
-    //  return false;
-    //}
-
     std::string csrfile;
     if (!m_cfg->getValue("SERVER_CERT", "CSRFILE", csrfile))
     {
@@ -1812,12 +2337,9 @@ bool Reflector::loadServerCertificateFiles(void)
     req.sign(pkey);
     if (!req.writePemFile(csrfile))
     {
-      // FIXME: Read SSL error stack
-
       std::cerr << "*** WARNING: Failed to write server certificate "
                    "signing request file to '" << csrfile << "'"
                 << std::endl;
-      //return false;
     }
     std::cout << "-------- Certificate Signing Request -------" << std::endl;
     req.print();
@@ -1883,7 +2405,6 @@ bool Reflector::generateKeyFile(Async::SslKeypair& pkey,
 
 bool Reflector::loadRootCAFiles(void)
 {
-    // Read root CA private key or generate a new one if it does not exist
   std::string ca_keyfile;
   if (!m_cfg->getValue("ROOT_CA", "KEYFILE", ca_keyfile))
   {
@@ -1902,7 +2423,7 @@ bool Reflector::loadRootCAFiles(void)
         !m_ca_pkey.writePrivateKeyFile(ca_keyfile))
     {
       std::cerr << "*** ERROR: Failed to write root CA private key file to '"
-                << ca_keyfile << "'" << std::endl;
+                 << ca_keyfile << "'" << std::endl;
       return false;
     }
   }
@@ -1913,7 +2434,6 @@ bool Reflector::loadRootCAFiles(void)
     return false;
   }
 
-    // Read the root CA certificate or generate a new one if it does not exist
   std::string ca_crtfile;
   if (!m_cfg->getValue("ROOT_CA", "CRTFILE", ca_crtfile))
   {
@@ -1959,8 +2479,7 @@ bool Reflector::loadRootCAFiles(void)
     {
       m_ca_cert.addIssuerName("O", value);
     }
-    if (m_cfg->getValue("ROOT_CA", "LOCALITY", value) &&
-        !value.empty())
+    if (m_cfg->getValue("ROOT_CA", "LOCALITY", value) && !value.empty())
     {
       m_ca_cert.addIssuerName("L", value);
     }
@@ -2002,7 +2521,6 @@ bool Reflector::loadRootCAFiles(void)
 
 bool Reflector::loadSigningCAFiles(void)
 {
-    // Read issuing CA private key or generate a new one if it does not exist
   std::string ca_keyfile;
   if (!m_cfg->getValue("ISSUING_CA", "KEYFILE", ca_keyfile))
   {
@@ -2032,7 +2550,6 @@ bool Reflector::loadSigningCAFiles(void)
     return false;
   }
 
-    // Read the CA certificate or generate a new one if it does not exist
   std::string ca_crtfile;
   if (!m_cfg->getValue("ISSUING_CA", "CRTFILE", ca_crtfile))
   {
@@ -2123,7 +2640,6 @@ bool Reflector::loadSigningCAFiles(void)
     csr.addExtensions(exts);
     csr.setPublicKey(m_issue_ca_pkey);
     csr.sign(m_issue_ca_pkey);
-    //csr.print();
     if (!csr.writePemFile(ca_csrfile))
     {
       std::cout << "*** ERROR: Failed to write issuing CA CSR file '"
@@ -2161,9 +2677,6 @@ bool Reflector::loadSigningCAFiles(void)
 bool Reflector::onVerifyPeer(TcpConnection *con, bool preverify_ok,
                              X509_STORE_CTX *x509_store_ctx)
 {
-  //std::cout << "### Reflector::onVerifyPeer: preverify_ok="
-  //          << (preverify_ok ? "yes" : "no") << std::endl;
-
   Async::SslX509 cert(*x509_store_ctx);
   preverify_ok = preverify_ok && !cert.isNull();
   preverify_ok = preverify_ok && !cert.commonName().empty();
@@ -2189,7 +2702,6 @@ bool Reflector::buildPath(const std::string& sec,    const std::string& tag,
   {
     path = defpath;
   }
-  //std::cout << "### sec=" << sec << "  tag=" << tag << "  defdir=" << defdir << "  defpath=" << defpath << "  path=" << path << std::endl;
   if ((path.front() != '/') && (path.front() != '.'))
   {
     path = defdir + "/" + defpath;
@@ -2206,7 +2718,6 @@ bool Reflector::buildPath(const std::string& sec,    const std::string& tag,
   {
     defpath = std::move(path);
   }
-  //std::cout << "### defpath=" << defpath << std::endl;
   return true;
 } /* Reflector::buildPath */
 
@@ -2225,7 +2736,7 @@ void Reflector::runCAHook(const Async::Exec::Environment& env)
   {
     auto ca_hook = new Async::Exec(ca_hook_cmd);
     ca_hook->addEnvironmentVars(env);
-    ca_hook->setTimeout(300); // Five minutes timeout
+    ca_hook->setTimeout(300);
     ca_hook->stdoutData.connect(
         [=](const char* buf, int cnt)
         {
@@ -2261,4 +2772,3 @@ void Reflector::runCAHook(const Async::Exec::Environment& env)
 /*
  * This file has not been truncated
  */
-

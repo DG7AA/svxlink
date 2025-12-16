@@ -38,6 +38,7 @@ Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
 #include <json/json.h>
 #include <sigc++/sigc++.h>
 #include <random>
+#include <limits>   // <-- hinzugefügt für PERM_BLOCKTIME
 
 
 /****************************************************************************
@@ -129,6 +130,10 @@ class ReflectorClient : public sigc::trackable
       STATE_EXPECT_AUTH_RESPONSE,
       STATE_CONNECTED
     } ConState;
+
+    // Permanente Blockzeit: größter unsigned-Wert
+    static constexpr unsigned PERM_BLOCKTIME =
+        std::numeric_limits<unsigned>::max();
 
     class Filter
     {
@@ -414,9 +419,7 @@ class ReflectorClient : public sigc::trackable
      * @brief   Block client audio for the specified time
      * @param   The number of seconds to block
      *
-     * This function is used to block the client from sending audio for the
-     * specified time. This is used by the Reflector if a client has been
-     * talking for too long.
+     * Pass PERM_BLOCKTIME for a permanent block.
      */
     void setBlock(unsigned blocktime);
 

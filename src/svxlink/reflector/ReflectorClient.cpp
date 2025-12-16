@@ -38,6 +38,7 @@ Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
 #include <cerrno>
 #include <ctime>
 #include <iterator>
+// <limits> wird über das Header bereits eingebunden
 
 
 /****************************************************************************
@@ -313,7 +314,11 @@ void ReflectorClient::udpMsgReceived(const ReflectorUdpMsg &header)
 
   if ((m_blocktime > 0) && (header.type() == MsgUdpAudio::TYPE))
   {
-    m_remaining_blocktime = m_blocktime;
+    // Bei aktivem Block wird das Restfenster auf den Blockwert zurückgesetzt.
+    // Permanent-Block bleibt permanent maximal.
+    m_remaining_blocktime = (m_blocktime == PERM_BLOCKTIME)
+                              ? PERM_BLOCKTIME
+                              : m_blocktime;
   }
 } /* ReflectorClient::udpMsgReceived */
 
@@ -333,15 +338,27 @@ void ReflectorClient::sendUdpMsg(const ReflectorUdpMsg &msg)
 
 void ReflectorClient::setBlock(unsigned blocktime)
 {
-  if (blocktime > 0)
+  if (blocktime == 0)
   {
-    std::cout << m_callsign << ": Blocking talker for " << blocktime
-              << " seconds" << std::endl;
+    if (m_blocktime == PERM_BLOCKTIME || m_blocktime > 0)
+    {
+      std::cout << m_callsign << ": Unblocking talker" << std::endl;
+    }
+    m_blocktime = 0;
+    m_remaining_blocktime = 0;
+    return;
   }
-  else if (m_blocktime > 0)
+
+  if (blocktime == PERM_BLOCKTIME)
   {
-    std::cout << m_callsign << ": Unblocking talker" << std::endl;
+    std::cout << m_callsign << ": Blocking talker permanently" << std::endl;
+    m_blocktime = PERM_BLOCKTIME;
+    m_remaining_blocktime = PERM_BLOCKTIME;
+    return;
   }
+
+  std::cout << m_callsign << ": Blocking talker for " << blocktime
+            << " seconds" << std::endl;
   m_blocktime = blocktime;
   m_remaining_blocktime = blocktime;
 } /* ReflectorClient::setBlock */
@@ -429,17 +446,6 @@ void ReflectorClient::onSslConnectionReady(TcpConnection *con)
     sendMsg(MsgClientCsrRequest());
     m_con_state = STATE_EXPECT_CSR;
     return;
-    //MsgAuthChallenge challenge_msg;
-    //if (challenge_msg.challenge() == nullptr)
-    //{
-    //  disconnect();
-    //  return;
-    //}
-    //memcpy(m_auth_challenge, challenge_msg.challenge(),
-    //       MsgAuthChallenge::LENGTH);
-    //sendMsg(challenge_msg);
-    //m_con_state = STATE_EXPECT_AUTH_RESPONSE;
-    //return;
   }
 
   std::cout << "------------- Client Certificate --------------" << std::endl;
@@ -457,14 +463,7 @@ void ReflectorClient::onSslConnectionReady(TcpConnection *con)
     return;
   }
 
-    // Set cert renewal timer to expire one minute after the actual renewal
-    // time to avoid a race condition. Also delay renewal to at least 10
-    // minutes after node connection to reduce problems with renewal loops.
-    // Renewal loops may occur if the client does not accept a new certificate
-    // for some reason and upon reconnection continue to use the old
-    // certificate, in which case the reflector will send the new cert again,
-    // and so on. This may happen if the real-time clock is not correctly set
-    // on the node.
+    // Set cert renewal timer
   time_t renew_time = std::max(
       std::time(NULL) + 10*60,
       Reflector::timeToRenewCert(peer_cert) + 60);
@@ -513,14 +512,10 @@ void ReflectorClient::onFrameReceived(FramedTcpConnection *con,
 
   if ((m_con_state != STATE_CONNECTED) && (header.type() >= 100))
   {
-      // FIXME: This should really be an error and the client should be
-      // disconnected but it will cause too much problems in existing
-      // misbeaving clients at the moment.
     std::cout << "*** WARNING[" << idss.str()
               << "]: User message " << header.type()
               << " received in unauthenticated state"
               << std::endl;
-    //sendError("Protocol error");
     return;
   }
 
@@ -560,11 +555,6 @@ void ReflectorClient::onFrameReceived(FramedTcpConnection *con,
     case MsgTxStatus::TYPE:
       handleMsgTxStatus(ss);
       break;
-#if 0
-    case MsgNodeInfo::TYPE:
-      handleNodeInfo(ss);
-      break;
-#endif
     case MsgRequestQsy::TYPE:
       handleRequestQsy(ss);
       break;
@@ -575,11 +565,6 @@ void ReflectorClient::onFrameReceived(FramedTcpConnection *con,
       handleMsgError(ss);
       break;
     default:
-      // Better just ignoring unknown protocol messages for making it easier to
-      // add messages to the protocol and still be backwards compatible.
-
-      //cerr << "*** WARNING: Unknown protocol message received: msg_type="
-      //     << header.type() << endl;
       break;
   }
 } /* ReflectorClient::onFrameReceived */
@@ -646,9 +631,6 @@ void ReflectorClient::handleMsgProtoVer(std::istream& is)
 
   if (m_client_proto_ver.majorVer() >= 3)
   {
-    //std::cout << "### ReflectorClient::handMsgProtoVer: Send CAInfo"
-    //          << std::endl;
-    //m_con->setMaxRxFrameSize(ReflectorMsg::MAX_PRE_SSL_SETUP_FRAME_SIZE);
     sendMsg(MsgCAInfo(m_reflector->caSize(), m_reflector->caDigest()));
     m_con_state = STATE_EXPECT_START_ENCRYPTION;
   }
@@ -661,8 +643,6 @@ void ReflectorClient::handleMsgProtoVer(std::istream& is)
 
 void ReflectorClient::handleMsgCABundleRequest(std::istream& is)
 {
-  //std::cout << "### ReflectorClient::handleMsgCABundleRequest" << std::endl;
-
   if (m_con_state != STATE_EXPECT_START_ENCRYPTION)
   {
     std::cout << "*** ERROR[" << m_con->remoteHost() << ":"
@@ -671,9 +651,6 @@ void ReflectorClient::handleMsgCABundleRequest(std::istream& is)
     disconnect();
     return;
   }
-
-  //std::cout << "### Sending CA Bundle" << std::endl;
-  //m_con->setMaxRxFrameSize(ReflectorMsg::MAX_PRE_SSL_SETUP_FRAME_SIZE);
   sendMsg(MsgCABundle(m_reflector->caBundlePem(), m_reflector->caSignature(),
                       m_reflector->issuingCertPem()));
 } /* ReflectorClient::handleMsgCABundleRequest */
@@ -681,9 +658,6 @@ void ReflectorClient::handleMsgCABundleRequest(std::istream& is)
 
 void ReflectorClient::handleMsgStartEncryptionRequest(std::istream& is)
 {
-  //std::cout << "### ReflectorClient::handleMsgStartEncryptionRequest"
-  //          << std::endl;
-
   if (m_con_state != STATE_EXPECT_START_ENCRYPTION)
   {
     std::cout << "*** ERROR[" << m_con->remoteHost() << ":"
@@ -744,25 +718,6 @@ void ReflectorClient::handleMsgAuthResponse(std::istream& is)
     sendError("Invalid callsign");
     return;
   }
-
-  //const auto peer_cert = m_reflector->loadClientCertificate(msg.callsign());
-  //if (!peer_cert.isNull())
-  //{
-  //  std::cout << "Client " << m_con->remoteHost() << ":"
-  //            << m_con->remotePort() << " (" << msg.callsign() << "?)"
-  //            << ": Sending client certificate to peer" << std::endl;
-  //  //sendMsg(MsgClientCert(peer_cert.pem()));
-  //  sendClientCert(peer_cert);
-  //  //m_con_state = STATE_EXPECT_CSR;
-  //  return;
-  //}
-  //else //if (m_reflector->loadClientPendingCsr(msg.callsign()).isNull())
-  //{
-  //  std::cout << "Client " << m_con->remoteHost() << ":"
-  //            << m_con->remotePort() << " (" << msg.callsign() << "?)"
-  //            << ": Sending CSR request to peer" << std::endl;
-  //  sendMsg(MsgClientCsrRequest());
-  //}
 
   string auth_key = lookupUserKey(msg.callsign());
   if (!auth_key.empty() && msg.verify(auth_key, m_auth_challenge))
@@ -837,7 +792,6 @@ void ReflectorClient::handleMsgClientCsr(std::istream& is)
       sendClientCert(cert))
   {
     std::cout << idss.str() << ": Sent certificate to peer" << std::endl;
-    //cert.print();
     m_con_state = STATE_EXPECT_DISCONNECT;
   }
   else if (m_con_state == STATE_EXPECT_CSR)
@@ -925,9 +879,6 @@ void ReflectorClient::handleNodeInfo(std::istream& is)
       sendError("Illegal MsgNodeInfo protocol message received");
       return;
     }
-    //std::cout << "### handleNodeInfo: udpSrcPort()=" << msg.udpSrcPort()
-    //          << " JSON=" << msg.json() << std::endl;
-    //setRemoteUdpSource(msg.udpSrcPort());
     setUdpCipherIVRand(msg.ivRand());
     setUdpCipherKey(msg.udpCipherKey());
     jsonstr = msg.json();
@@ -961,17 +912,14 @@ void ReflectorClient::handleNodeInfo(std::istream& is)
     setTg(m_current_tg);
     if (status.isMember("qth") && status["qth"].isArray())
     {
-      //std::cout << "### Found qth" << std::endl;
       Json::Value& qths(status["qth"]);
       for (Json::Value::ArrayIndex i=0; i<qths.size(); ++i)
       {
         Json::Value& qth(qths[i]);
         if (qth.isMember("rx") && qth["rx"].isObject())
         {
-          //std::cout << "### Found rx" << std::endl;
           for (const auto& rx_id_str : qth["rx"].getMemberNames())
           {
-            //std::cout << "### member=" << *it << std::endl;
             if (rx_id_str.size() == 1)
             {
               char rx_id(rx_id_str[0]);
@@ -989,10 +937,8 @@ void ReflectorClient::handleNodeInfo(std::istream& is)
         }
         if (qth.isMember("tx") && qth["tx"].isObject())
         {
-          //std::cout << "### Found tx" << std::endl;
           for (const auto& tx_id_str : qth["tx"].getMemberNames())
           {
-            //std::cout << "### member=" << *it << std::endl;
             if (tx_id_str.size() == 1)
             {
               char tx_id(tx_id_str[0]);
@@ -1030,14 +976,7 @@ void ReflectorClient::handleMsgSignalStrengthValues(std::istream& is)
   typedef MsgSignalStrengthValues::Rxs::const_iterator RxsIter;
   for (RxsIter it = msg.rxs().begin(); it != msg.rxs().end(); ++it)
   {
-    const MsgSignalStrengthValues::Rx& rx = *it;
-    //std::cout << "### MsgSignalStrengthValues:"
-    //  << " id=" << rx.id()
-    //  << " siglev=" << rx.siglev()
-    //  << " enabled=" << rx.enabled()
-    //  << " sql_open=" << rx.sqlOpen()
-    //  << " active=" << rx.active()
-    //  << std::endl;
+    const MsgUdpSignalStrengthValues::Rx& rx = *it; // (Typ alias ok)
     setRxSiglev(rx.id(), rx.siglev());
     setRxEnabled(rx.id(), rx.enabled());
     setRxSqlOpen(rx.id(), rx.sqlOpen());
@@ -1059,10 +998,6 @@ void ReflectorClient::handleMsgTxStatus(std::istream& is)
   for (TxsIter it = msg.txs().begin(); it != msg.txs().end(); ++it)
   {
     const MsgTxStatus::Tx& tx = *it;
-    //std::cout << "### MsgTxStatus:"
-    //  << " id=" << tx.id()
-    //  << " transmit=" << tx.transmit()
-    //  << std::endl;
     setTxTransmit(tx.id(), tx.transmit());
   }
 } /* ReflectorClient::handleMsgTxStatus */
@@ -1098,88 +1033,6 @@ void ReflectorClient::handleStateEvent(std::istream& is)
        << " msg=" << msg.msg()
        << std::endl;
 } /* ReflectorClient::handleStateEvent */
-
-
-#if 0
-void ReflectorClient::handleNodeInfo(std::istream& is)
-{
-  MsgNodeInfo msg;
-  if (!msg.unpack(is))
-  {
-    cout << "Client " << m_con->remoteHost() << ":" << m_con->remotePort()
-         << " ERROR: Could not unpack MsgNodeInfo" << endl;
-    sendError("Illegal MsgNodeInfo protocol message received");
-    return;
-  }
-  cout << m_callsign << ": Client info"
-       << "\n--- Software: \"" << msg.swInfo() << "\"";
-  for (size_t i=0; i<msg.rxSites().size(); ++i)
-  {
-    const MsgNodeInfo::RxSite& rx_site = msg.rxSites().at(i);
-    cout << "\n--- Receiver \"" << rx_site.rxName() << "\":"
-         << "\n---   QTH Name          : " << rx_site.qthName();
-    if (rx_site.antennaHeightIsValid())
-    {
-      cout << "\n---   Antenna Height    : " << rx_site.antennaHeight()
-           << "m above sea level";
-    }
-    if (rx_site.antennaDirectionIsValid())
-    {
-      cout << "\n---   Antenna Direction : " << rx_site.antennaDirection()
-           << " degrees";
-    }
-    if (rx_site.rfFrequencyIsValid())
-    {
-      cout << "\n---   RF Frequency      : " << rx_site.rfFrequency()
-           << "Hz";
-    }
-    if (rx_site.ctcssFrequenciesIsValid())
-    {
-      cout << "\n---   CTCSS Frequencies : ";
-      std::copy(rx_site.ctcssFrequencies().begin(),
-                rx_site.ctcssFrequencies().end(),
-                std::ostream_iterator<float>(cout, " "));
-    }
-  }
-  for (size_t i=0; i<msg.txSites().size(); ++i)
-  {
-    const MsgNodeInfo::TxSite& tx_site = msg.txSites().at(i);
-    cout << "\n--- Transmitter \"" << tx_site.txName() << "\":"
-         << "\n---   QTH Name          : " << tx_site.qthName();
-    if (tx_site.antennaHeightIsValid())
-    {
-      cout << "\n---   Antenna Height    : " << tx_site.antennaHeight()
-           << "m above sea level";
-    }
-    if (tx_site.antennaDirectionIsValid())
-    {
-      cout << "\n---   Antenna Direction : " << tx_site.antennaDirection()
-           << " degrees";
-    }
-    if (tx_site.rfFrequencyIsValid())
-    {
-      cout << "\n---   RF Frequency      : " << tx_site.rfFrequency()
-           << "Hz";
-    }
-    if (tx_site.ctcssFrequenciesIsValid())
-    {
-      cout << "\n---   CTCSS Frequencies : ";
-      std::copy(tx_site.ctcssFrequencies().begin(),
-                tx_site.ctcssFrequencies().end(),
-                std::ostream_iterator<float>(cout, " "));
-    }
-    if (tx_site.txPowerIsValid())
-    {
-      cout << "\n---   TX Power          : " << tx_site.txPower() << "W";
-    }
-  }
-  //if (!msg.qthName().empty())
-  //{
-  //  cout << "\n--- QTH Name=\"" << msg.qthName() << "\"";
-  //}
-  cout << endl;
-} /* ReflectorClient::handleNodeInfo */
-#endif
 
 
 void ReflectorClient::handleMsgError(std::istream& is)
@@ -1272,7 +1125,8 @@ void ReflectorClient::handleHeartbeat(Async::Timer *t)
     sendError("UDP heartbeat timeout");
   }
 
-  if (m_blocktime > 0)
+  // Block-Countdown nur für zeitlich befristete Blöcke
+  if (m_blocktime > 0 && m_blocktime != PERM_BLOCKTIME)
   {
     if (m_remaining_blocktime == 0)
     {
@@ -1363,9 +1217,6 @@ bool ReflectorClient::sendClientCert(const Async::SslX509& cert)
   const auto pending_csr = m_reflector->loadClientPendingCsr(callsign);
   if (!pending_csr.isNull() && (cert.publicKey() != pending_csr.publicKey()))
   {
-    //std::cout << "### ReflectorClient::sendClientCert: Cert public key "
-    //             "differs compared to pending CSR public key" << std::endl;
-    //sendMsg(MsgClientCert());
     return false;
   }
   return sendMsg(MsgClientCert(m_reflector->clientCertPem(callsign)));
@@ -1433,7 +1284,6 @@ void ReflectorClient::setTg(uint32_t tg)
     }
     else
     {
-      // FIXME: Notify the client that the TG selection was not allowed
       std::cout << m_callsign << ": Not allowed to use TG #" << tg << std::endl;
       TGHandler::instance()->switchTo(this, 0);
       tg = 0;
@@ -1460,4 +1310,3 @@ void ReflectorClient::setTg(uint32_t tg)
 /*
  * This file has not been truncated
  */
-
